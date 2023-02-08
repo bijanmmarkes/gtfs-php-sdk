@@ -79,9 +79,10 @@ class GtfsArchive
     private static function createRequestContext(?\DateTime $lastModified = null)
     {
         self::$archiveLastModified = $lastModified !== null ? self::getLastModifiedFromDateTime($lastModified) : '';
+        $header = !empty(self::$archiveLastModified) ? "If-Modified-Since: " . self::$archiveLastModified : '';
         return stream_context_create([
             'http' => [
-                'header' => "If-Modified-Since: " . self::$archiveLastModified,
+                'header' => $header,
                 'method'        => 'GET',
                 'ignore_errors' => true
             ],
