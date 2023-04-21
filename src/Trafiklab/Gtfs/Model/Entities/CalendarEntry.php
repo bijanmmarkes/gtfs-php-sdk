@@ -49,7 +49,7 @@ class CalendarEntry
     /**
      * @return int
      */
-    public function getMonday()
+    public function getMonday(): int
     {
         return $this->monday;
     }
@@ -57,7 +57,7 @@ class CalendarEntry
     /**
      * @return int
      */
-    public function getTuesday()
+    public function getTuesday(): int
     {
         return $this->tuesday;
     }
@@ -65,7 +65,7 @@ class CalendarEntry
     /**
      * @return int
      */
-    public function getWednesday()
+    public function getWednesday(): int
     {
         return $this->wednesday;
     }
@@ -73,7 +73,7 @@ class CalendarEntry
     /**
      * @return int
      */
-    public function getThursday()
+    public function getThursday(): int
     {
         return $this->thursday;
     }
@@ -81,7 +81,7 @@ class CalendarEntry
     /**
      * @return int
      */
-    public function getFriday()
+    public function getFriday(): int
     {
         return $this->friday;
     }
@@ -89,7 +89,7 @@ class CalendarEntry
     /**
      * @return int
      */
-    public function getSaturday()
+    public function getSaturday(): int
     {
         return $this->saturday;
     }
@@ -97,7 +97,7 @@ class CalendarEntry
     /**
      * @return int
      */
-    public function getSunday()
+    public function getSunday(): int
     {
         return $this->sunday;
     }
