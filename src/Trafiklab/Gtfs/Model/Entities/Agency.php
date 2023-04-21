@@ -44,9 +44,9 @@ class Agency
      * A transit feed can represent data from more than one agency. This field is required for transit feeds that
      * contain data for multiple agencies. Otherwise, it's optional.
      *
-     * @return string
+     * @return null|string
      */
-    public function getAgencyId(): string
+    public function getAgencyId(): ?string
     {
         return $this->agency_id;
     }
