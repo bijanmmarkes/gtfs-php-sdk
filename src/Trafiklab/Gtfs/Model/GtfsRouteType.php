@@ -165,6 +165,10 @@ class GtfsRouteType
         '1013', '1014', '1015', '1016', '1017', '1018', '1019', '1020', '1021',
     ];
 
+    const CABLE_TYPES = [
+        '5', '6', '7', '1302', '1701'
+    ];
+
     public static function isBus(int $type): bool
     {
         return in_array($type, self::BUS_TYPES);
@@ -188,6 +192,10 @@ class GtfsRouteType
     public static function isFerry(int $type): bool
     {
         return in_array($type, self::FERRY_TYPES);
+    }
+    public static function isCableCar(int $type): bool
+    {
+        return in_array($type, self::CABLE_TYPES);
     }
 
     /**
@@ -219,6 +227,40 @@ class GtfsRouteType
         if (self::isFerry($type)) {
             return 4;
         }
+
+        if (self::isCableCar($type)) {
+            return 5;
+        }
+
         return -1;
+    }
+
+    public static function mapRouteTypeToText(int $type): string
+    {
+        if (self::isTram($type)) {
+            return "Tram";
+        }
+
+        if (self::isMetro($type)) {
+            return "Metro";
+        }
+
+        if (self::isTrain($type)) {
+            return "Train";
+        }
+
+        if (self::isBus($type)) {
+            return "Bus";
+        }
+
+        if (self::isFerry($type)) {
+            return "Ferry";
+        }
+
+        if (self::isCableCar($type)) {
+            return "Cable Car";
+        }
+
+        return "Route";
     }
 }

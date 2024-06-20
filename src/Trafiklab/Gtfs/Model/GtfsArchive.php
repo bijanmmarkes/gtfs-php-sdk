@@ -405,13 +405,15 @@ class GtfsArchive
      */
     public function getLastModifiedDateTime(): ?\DateTime
     {
-        $datetime = (
-            new \DateTime(
-                self::$archiveLastModified,
-                new \DateTimeZone('GMT')
-            )
-        );
-        return self::$archiveLastModified !== null ? $datetime : null;
+        if (self::$archiveLastModified !== null) {
+            return (
+                new \DateTime(
+                    self::$archiveLastModified,
+                    new \DateTimeZone('GMT')
+                )
+            );
+        }
+        return null;
     }
 
     /**
