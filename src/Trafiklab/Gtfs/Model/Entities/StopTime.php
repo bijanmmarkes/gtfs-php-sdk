@@ -92,9 +92,9 @@ class StopTime
      * should have stop_id=1 in all subsequent data updates. If a stop isn't a timepoint, enter blank values for
      * arrival_time and departure_time. For more details, see Timepoints.
      *
-     * @return string
+     * @return null|string
      */
-    public function getStopId(): string
+    public function getStopId(): ?string
     {
         return $this->stop_id;
     }
