@@ -4,7 +4,14 @@
 namespace Trafiklab\Gtfs\Model;
 
 
+use Composer\CaBundle\CaBundle;
 use Exception;
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\Exception\GuzzleException;
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\RequestOptions;
+use Psr\Http\Message\ResponseInterface;
 use Trafiklab\Gtfs\Model\Files\GtfsAgencyFile;
 use Trafiklab\Gtfs\Model\Files\GtfsCalendarDatesFile;
 use Trafiklab\Gtfs\Model\Files\GtfsCalendarFile;
@@ -17,6 +24,7 @@ use Trafiklab\Gtfs\Model\Files\GtfsStopsFile;
 use Trafiklab\Gtfs\Model\Files\GtfsStopTimesFile;
 use Trafiklab\Gtfs\Model\Files\GtfsTransfersFile;
 use Trafiklab\Gtfs\Model\Files\GtfsTripsFile;
+use Trafiklab\Gtfs\Util\Internal\AiaCertificateResolver;
 use Trafiklab\Gtfs\Util\Internal\ArrayCache;
 use ZipArchive;
 
@@ -73,20 +81,116 @@ class GtfsArchive
     }
 
     /**
-     * Creates the context and returns it for use in file_get_contents
-     * Adds the If-Modified-Since header to check if the GTFS has been modified.
+     * Build a Guzzle client with sensible defaults for downloading GTFS archives.
+     *
+     * The CA bundle comes from composer/ca-bundle (Mozilla NSS roots) so
+     * behavior is consistent across environments regardless of php.ini's
+     * openssl.cafile.
+     *
+     * Some GTFS hosts serve incomplete certificate chains (the leaf cert
+     * but not the intermediate that signs it). Browsers and the curl
+     * binary work around this via "AIA chasing" — fetching the missing
+     * intermediate from the URL embedded in the leaf cert. PHP's curl-
+     * with-OpenSSL does not. {@see executeWithAiaFallback()} retries any
+     * request that fails verification with an augmented CA bundle built
+     * by {@see AiaCertificateResolver}, so this works automatically for
+     * any host whose cert has a valid AIA extension.
+     *
+     * @param string|null $caBundleOverride Per-host CA bundle to use for
+     *     this client instance (used by the AIA retry path). Null means
+     *     "use the system default".
      */
-    private static function createRequestContext(?\DateTime $lastModified = null)
+    private static function createHttpClient(?string $caBundleOverride = null): Client
     {
-        self::$archiveLastModified = $lastModified !== null ? self::getLastModifiedFromDateTime($lastModified) : '';
-        $header = !empty(self::$archiveLastModified) ? "If-Modified-Since: " . self::$archiveLastModified : '';
-        return stream_context_create([
-            'http' => [
-                'header' => $header,
-                'method'        => 'GET',
-                'ignore_errors' => true
+        return new Client([
+            RequestOptions::TIMEOUT         => 120,
+            RequestOptions::CONNECT_TIMEOUT => 15,
+            RequestOptions::HTTP_ERRORS     => false, // we want to inspect 304/4xx ourselves
+            RequestOptions::VERIFY          => $caBundleOverride ?? CaBundle::getSystemCaRootBundlePath(),
+            RequestOptions::HEADERS         => [
+                'User-Agent' => 'trafiklab/gtfs-php-sdk',
             ],
         ]);
+    }
+
+    /**
+     * Execute a Guzzle GET request, transparently retrying once with an
+     * AIA-augmented CA bundle if the first attempt fails TLS verification.
+     *
+     * This is the seam where AIA chasing happens — keeping it here means
+     * both download paths (createFromUrl + createFromUrlIfModified) get
+     * the workaround for free with no per-call boilerplate.
+     *
+     * Behavior:
+     *  - If the host has previously needed AIA chasing (we have a cached
+     *    bundle for it), use that bundle directly — no failing first
+     *    attempt. Saves ~1s per request on known-broken hosts.
+     *  - Otherwise try with the default system bundle first.
+     *  - Verification failures (cURL errno 60 OR 77) trigger one retry
+     *    with intermediates fetched from the host's AIA URL.
+     *  - All other errors propagate untouched.
+     *  - If the AIA discovery itself fails (no AIA URL, fetch failure,
+     *    etc.) we re-throw the ORIGINAL verification error so the caller
+     *    sees the real problem rather than a confusing AIA error.
+     *
+     * @param array<string, mixed> $options Guzzle request options (sink, headers, etc.).
+     * @throws GuzzleException
+     */
+    private static function executeWithAiaFallback(string $url, array $options): ResponseInterface
+    {
+        // Fast path: if we already have AIA-discovered intermediates cached
+        // for this host, use the augmented bundle directly. AiaCertificateResolver
+        // returns a cached path without re-running the TLS probe.
+        $systemBundle = CaBundle::getSystemCaRootBundlePath();
+        $cachedBundle = AiaCertificateResolver::getCachedBundleForHost($url, $systemBundle);
+        if ($cachedBundle !== null) {
+            return self::createHttpClient($cachedBundle)->request('GET', $url, $options);
+        }
+
+        try {
+            return self::createHttpClient()->request('GET', $url, $options);
+        } catch (ConnectException | RequestException $exception) {
+            if (!self::isTlsVerifyFailure($exception)) {
+                throw $exception;
+            }
+
+            $augmentedBundle = AiaCertificateResolver::buildAugmentedBundle($url, $systemBundle);
+
+            if ($augmentedBundle === null) {
+                // AIA chasing didn't help (no AIA URL, fetch failed, etc.).
+                // Re-throw the ORIGINAL verify error rather than masking it.
+                throw $exception;
+            }
+
+            return self::createHttpClient($augmentedBundle)->request('GET', $url, $options);
+        }
+    }
+
+    /**
+     * Detects the curl error codes that indicate a TLS verification failure
+     * worth attempting AIA chasing for:
+     *
+     *   60 = CURLE_SSL_CACERT — peer cert can't be authenticated with the
+     *        given CA cert(s). The classic missing-intermediate symptom.
+     *   77 = CURLE_SSL_CACERT_BADFILE — problem reading the CA bundle.
+     *        Less likely AIA-fixable but harmless to try.
+     */
+    private static function isTlsVerifyFailure(GuzzleException $exception): bool
+    {
+        if (!$exception instanceof ConnectException && !$exception instanceof RequestException) {
+            return false;
+        }
+        $context = $exception->getHandlerContext();
+        $errno   = $context['errno'] ?? null;
+        if ($errno === 60 || $errno === 77) {
+            return true;
+        }
+        // Some Guzzle versions surface only the message; fall back to a
+        // string match for the most common cases.
+        $message = $exception->getMessage();
+        return str_contains($message, 'cURL error 60')
+            || str_contains($message, 'unable to get local issuer certificate')
+            || str_contains($message, 'certificate verify failed');
     }
 
     /**
@@ -100,8 +204,13 @@ class GtfsArchive
     }
 
     /**
-     * Only create a new Archive if it has been modified since the last PULL
-     * We delete the Zip archive after each cycle as this is meant to constantly check headers.
+     * Only create a new Archive if it has been modified since the last PULL.
+     * We delete the Zip archive after each cycle as this is meant to constantly
+     * check headers.
+     *
+     * Sends If-Modified-Since (when $lastModified is provided) and treats a
+     * 304 response as "no change". Returns null on 304; throws on non-2xx.
+     *
      * @param string $url
      * @param \DateTime|null $lastModified
      * @param string|null $eTag
@@ -114,71 +223,78 @@ class GtfsArchive
         ?string $eTag = null
     ): ?GtfsArchive {
         $temp_file = self::TEMP_ROOT . md5($url) . ".zip";
-        if (!file_exists($temp_file)) {
-            try {
-                /** Create the Request Context (Returns Stream Context) */
-                $context = self::createRequestContext($lastModified);
-                /** Make the temp directory if it doesn't exist. */
-                self::makeTempDir();
-
-                /** Download the zip file if it's been modified, or exists. */
-                file_put_contents($temp_file, file_get_contents($url, false, $context));
-
-                /**
-                 * @var array $http_response_header materializes out of thin air unfortunately
-                 * Parse the headers so we can retrieve what we need.
-                 */
-                $responseHeaders = self::parseHeaders($http_response_header);
-
-                /** @var integer $statusCode
-                 * Track the Status code to determine if the file has changed, or exists.
-                 */
-                $statusCode = $responseHeaders['status'];
-                switch ($statusCode) {
-                    case 200:
-                        /**
-                         * If the Status Code is 200, that means the file has been modified or it is a new GTFS Source.
-                         * Track the eTag and Last-Modified headers if they exist.
-                         */
-                        self::$archiveLastModified = $responseHeaders['last-modified'] ?? null;
-                        self::$archiveETag = $responseHeaders['etag'] ?? null;
-
-                        /** If no last-modified date is present, and Etag is present and matches, skip as it's not modified
-                         *  If it returns 200 and LastModified is not null, that means that the Last-Modified date has changed.
-                         *  Should always respect the Last-Modified date over eTag if there's a mismatch.
-                         */
-                        if (
-                            ($lastModified === null) &&
-                            ($eTag !== null && self::$archiveETag !== null && $eTag == self::$archiveETag)
-                        ) {
-                            return null;
-                        } else {
-                            /**
-                             * Last-Modified Date wasn't present, and eTag is not present or didn't match.
-                             * Extract files and return the GtfsArchive.
-                             */
-                            $fileRoot = self::extractFiles($temp_file, true);
-                            return new GtfsArchive($fileRoot);
-                        }
-                    case 304:
-                        /**  304 = NOT_MODIFIED (This file hasn't changed since the last pull) */
-                        self::$archiveETag = $eTag;
-                        break;
-                    default:
-                        /** Status Code returned a 400 error or similar meaning the URL is invalid or down. */
-                        throw new Exception("Could not open the GTFS archive, Status Code: {$statusCode}");
-                }
-            } catch (Exception $exception) {
-                throw new Exception(
-                    "There was an issue downloading the GTFS from the requested URL: {$url}, Error: " .
-                    $exception->getMessage(), $statusCode ?? 0
-                );
-            } finally {
-                /** Clean up - Delete the Downloaded Zip if it exists. */
-                self::deleteArchive($temp_file);
-            }
+        if (file_exists($temp_file)) {
+            // Another concurrent caller is mid-download (or a prior run crashed
+            // before cleanup). Bail rather than racing.
+            return null;
         }
-        return null;
+
+        // Track the IMS string for getArchiveLastModified() consumers — set even
+        // on the early-return paths (matches legacy behavior).
+        self::$archiveLastModified = $lastModified !== null
+            ? self::getLastModifiedFromDateTime($lastModified)
+            : '';
+
+        try {
+            self::makeTempDir();
+
+            $headers = [];
+            if ($lastModified !== null) {
+                $headers['If-Modified-Since'] = self::$archiveLastModified;
+            }
+            // Note: we intentionally do NOT send If-None-Match here. The original
+            // implementation also did not — it compared the response ETag against
+            // the caller-supplied $eTag client-side. Preserving that contract.
+
+            $response = self::executeWithAiaFallback($url, [
+                RequestOptions::HEADERS => $headers,
+                RequestOptions::SINK    => $temp_file,
+            ]);
+
+            $statusCode = $response->getStatusCode();
+            switch ($statusCode) {
+                case 200:
+                    self::$archiveLastModified = $response->getHeaderLine('Last-Modified') ?: null;
+                    self::$archiveETag         = $response->getHeaderLine('ETag') ?: null;
+
+                    // Match the original quirky semantics: if the caller didn't
+                    // know a Last-Modified date but did know an ETag, and the
+                    // server returned the same ETag, treat it as "unchanged"
+                    // even though the server returned 200. (Some hosts ignore
+                    // If-None-Match but the ETag tells us nothing changed.)
+                    if (
+                        $lastModified === null
+                        && $eTag !== null
+                        && self::$archiveETag !== null
+                        && $eTag === self::$archiveETag
+                    ) {
+                        return null;
+                    }
+
+                    $fileRoot = self::extractFiles($temp_file, true);
+                    return new GtfsArchive($fileRoot);
+
+                case 304:
+                    // Not modified. Echo the caller-supplied ETag back so
+                    // getArchiveETag() stays consistent.
+                    self::$archiveETag = $eTag;
+                    return null;
+
+                default:
+                    throw new Exception("Could not open the GTFS archive, Status Code: {$statusCode}");
+            }
+        } catch (GuzzleException $exception) {
+            throw new Exception(
+                "There was an issue downloading the GTFS from the requested URL: {$url}, Error: " .
+                $exception->getMessage(),
+                0,
+                $exception
+            );
+        } finally {
+            // Clean up the on-disk zip if it survived past extraction (or if we
+            // failed before extracting).
+            self::deleteArchive($temp_file);
+        }
     }
 
     /**
@@ -196,19 +312,35 @@ class GtfsArchive
     }
 
     /**
-     * Download and extract the latest GTFS data set
+     * Download the latest GTFS archive to a temp file. No conditional-request
+     * semantics — used by createFromUrl().
      *
-     * @param string $url
-     *
-     * @return string
+     * @throws Exception
      */
     private static function downloadFile(string $url): string
     {
         $temp_file = self::TEMP_ROOT . md5($url) . ".zip";
 
         if (!file_exists($temp_file)) {
-            // Download zip file with GTFS data.
-            file_put_contents($temp_file, file_get_contents($url));
+            self::makeTempDir();
+            try {
+                $response = self::executeWithAiaFallback($url, [
+                    RequestOptions::SINK => $temp_file,
+                ]);
+                if ($response->getStatusCode() !== 200) {
+                    throw new Exception(
+                        "Could not download GTFS archive from {$url}, Status Code: " .
+                        $response->getStatusCode()
+                    );
+                }
+            } catch (GuzzleException $exception) {
+                throw new Exception(
+                    "There was an issue downloading the GTFS from the requested URL: {$url}, Error: " .
+                    $exception->getMessage(),
+                    0,
+                    $exception
+                );
+            }
         }
 
         return $temp_file;
@@ -372,29 +504,6 @@ class GtfsArchive
             $this->setCachedResult($method, new $class($this, $this->fileRoot . $file));
         }
         return $this->getCachedResult($method);
-    }
-
-    /**
-     * Parse file_get_contents Response headers into an array
-     * Primarily to retrieve the Status Code, Last-Modified, and ETag headers.
-     * @param array $headers
-     * @return array
-     */
-    private static function parseHeaders(array $headers): array
-    {
-        $headersArray = [];
-        foreach($headers as $k => $v) {
-            $t = explode(':', $v, 2);
-            if (isset($t[1])) {
-                $headersArray[ strtolower(trim($t[0])) ] = trim( $t[1] );
-            }
-            else {
-                $headersArray[] = $v;
-                if (preg_match("#HTTP/[0-9\.]+\s+([0-9]+)#", $v, $out) )
-                    $headersArray['status'] = intval($out[1]);
-            }
-        }
-        return $headersArray;
     }
 
     /**
